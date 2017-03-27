@@ -1,0 +1,473 @@
+
+// You can use any (4 or) 5 pins
+//#define sclk 2
+//#define mosi 3
+#define dc          9
+#define cs         10
+#define rst         8
+#define clock_pin  14
+#define cs_pin     16
+#define data_pin   15
+#define mode_button 7
+#define select_button 6
+#define left_button 5
+#define right_button 4
+
+
+// Color definitions
+#define	BLACK           0x0000
+#define	BLUE            0x001F
+#define	RED             0xF800
+#define	GREEN           0x07E0
+#define CYAN            0x07FF
+#define MAGENTA         0xF81F
+#define YELLOW          0xFFE0
+#define WHITE           0xFFFF
+
+#define TIMEMODE         0
+#define FREQMODE         1
+#define OPTIONSMODE      2
+
+#define CURSOR_ON        1
+#define CURSOR_OFF       0
+
+#define BUTTONPRESSED    1
+#define NUMBEROFMODES    3
+
+
+//Adafruit graphics libraries, written by Limor Fried
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1351.h>
+
+
+#include <SPI.h>
+#include <Arduino.h>
+#include <math.h>
+#include <stdlib.h>
+
+int mode;
+
+
+//ADC data
+int sampleDelay = 200; //time delay between ADC reads (microseconds)
+int f = 1000; //frequency of input signal for testing
+float fs = 7000; //sampling frquency
+volatile float realTime[512];  //real part of time domain
+float realFreq[512];  //real part of frequency domain
+
+float imaginary[512]; //imaginary part of frequency data (time domain is always zero)
+float amp[512];   //amplitude of frequency data
+float ampScaled[512]; //amplitude of frequency domain scaled to screen
+float calibrationFreq[512][8];
+float pastFreqsSum[512];
+
+float startTime; //time in microseconds when the data acquisition started
+float acquisitionTime; //length of time in microseconds that the ADC was read
+volatile int ADCCount = 0; //keeps track of the number of samples 
+volatile bool ADCFull = false; //stops reading the ADC after the required number of FFT points
+
+
+int FFTPoints = 512; //number of points read from ADC
+int freq[1024]; //frequency values
+
+int power = 9; //power of two for number of points in fourier transform
+float highest; //highest amplitude of frequency measurements (excluding dc bias
+
+int screenTime = 0; //time since last screen update
+int screenUpdate = 500000; //time between screen updates
+int screenLeftEdge; //index of data forming left edge of screen
+int screenRightEdge; //index of data forming right edge of screen
+int xAxisScale; //number of indeces between points on x axis
+
+
+//some unused modes variables that keep track of the cursor
+int cursorMode = CURSOR_ON;
+int leftEdge = 0;
+int rightEdge = leftEdge + SSD1351WIDTH;
+int cursorX = 0;
+int cursorY = 0;
+int modeCount = 0;
+int modeTime = 3;
+bool calibrationMode = 0;
+bool calibrationSave = 0;
+int calibrationCount = 0;
+int numberofAverages = 8;
+
+//strings that hold values that are to be displayed on the screen
+char xChar[15];
+char yChar[15];
+char FsChar[15];
+char distanceChar[15];
+
+Adafruit_SSD1351 tft = Adafruit_SSD1351(cs, dc, rst); //create screen object
+
+float p = 3.1415926; //pi
+double c = 299792458;
+
+double slope = 5e9;
+
+IntervalTimer ADCTimer;
+
+void setup(void) {
+  Serial.begin(9600);
+  tft.begin(); //initialize screen
+  //set pins
+  pinMode (clock_pin, OUTPUT);
+  pinMode (cs_pin, OUTPUT);
+  pinMode (data_pin, INPUT);
+  pinMode (mode_button, INPUT);
+  pinMode (select_button, INPUT);
+  pinMode (left_button, INPUT);
+  pinMode (right_button, INPUT);
+  //make screen black
+  tft.fillRect(0, 0, 128, 128, BLACK);
+
+  
+
+  //Write to screen
+  tftPrintTest();
+  //noInterrupts();
+  ADCTimer.begin(readADC, 125);
+}
+
+void loop() {
+  while (true) {
+    noInterrupts();
+    ADCCount = 0;
+    ADCFull = false;
+    startTime = micros(); //timing to find the sampling frequency
+    interrupts()
+    while(!ADCFull){
+      //Serial.println(ADCFull);
+    }
+    acquisitionTime = micros() - startTime; //time taken for data to be read
+    fs = (FFTPoints / (acquisitionTime / 1000000)); //calculate the sampling frequency
+
+
+     for(int t = 0; t < FFTPoints; t++){
+       realFreq[t] = realTime[t];
+       imaginary[t] = 0;
+     }
+  
+    //hann(realFreq, FFTPoints);
+    FFT(1, power, realFreq, imaginary); //calculate frequency domain data with fast fourier transform
+
+    for (int x = 0; x < FFTPoints; x++) { //calculate amplitude of frequency data
+      amp[x] = sqrt(pow(realFreq[x], 2) + pow(imaginary[x], 2));
+    }
+
+      if(calibrationMode){
+        if(digitalRead(mode_button) == BUTTONPRESSED){
+          calibrationSave = calibrationSave^1;
+        }
+        if(calibrationSave){
+          for(int x = 0; x < FFTPoints; x++){
+            amp[x] = amp[x] - pastFreqsSum[x];
+            if(amp[x] < 0){
+              amp[x] = 0;
+            }
+          }
+          
+        }
+        else{
+          for(int x = 0; x < FFTPoints; x++){
+            calibrationFreq[x][calibrationCount] = amp[x];
+          }
+          
+          if(calibrationCount <= numberofAverages){
+            calibrationCount++;
+          }
+          
+          for(int x = 0; x < FFTPoints; x++){
+            
+            for(int y = 0; y < numberofAverages; y++){
+              if(y == 0){
+                pastFreqsSum[x] = 0;
+              }
+              pastFreqsSum[x] = pastFreqsSum[x] + (calibrationFreq[x][y]/numberofAverages);
+            } 
+
+            
+            amp[x] = amp[x] - pastFreqsSum[x];
+            if(amp[x] < 0){
+              amp[x] = 0;
+            }
+          }
+        }
+          
+          
+        }
+
+
+
+    //crude way of normalizing results. Not necessarily effective in practice.
+    highest = 0; //stores highest amplitude
+    for (int k = 1; k < (FFTPoints/2); k++) { //search for highest amplitude
+      if (amp[k] > highest) {
+        highest = amp[k];
+        //Serial.println(highest);
+      }
+    }
+
+
+    for (int x = 0; x < FFTPoints; x++) { //create frequency values
+      freq[x] = x * fs / FFTPoints; //frequency values at points in FFT
+ 
+
+      ampScaled[x] = (amp[x] / highest) * (SSD1351HEIGHT - 1); //crudely scaled amplitude values
+    }
+
+
+    if ((micros() - screenTime) >= screenUpdate) { //for updating screen
+      screenTime = micros();
+      tft.fillScreen(BLACK);
+
+      cursorMode = CURSOR_ON;
+      //mode = FREQMODE;
+
+      //Serial.println(mode);
+      
+
+     //shifts cursor left if button is pressed
+        if (digitalRead(left_button) == BUTTONPRESSED){
+          if(digitalRead(mode_button) == BUTTONPRESSED){
+            if (cursorX >= 10){
+              cursorX = cursorX - 10;
+              Serial.println("TEST");
+            }
+            else{
+              cursorX = 0;
+            }
+          }
+          else{
+            if (cursorX > 0) {
+              cursorX--;
+            }
+          }
+        }
+      //shift cursor right if button is pressed
+        if (digitalRead(right_button) == BUTTONPRESSED){
+          if(digitalRead(mode_button) == BUTTONPRESSED){
+            if (cursorX < (FFTPoints - 10)) {
+              cursorX = cursorX + 10;
+              //Serial.println("TEST");
+            }
+            else{
+              cursorX = (FFTPoints - 1);
+            }
+          }
+          else{
+            if (cursorX < (FFTPoints-1)) {
+              cursorX++;
+              //Serial.println("test");
+            }
+          }
+        }
+
+        //toggle calibration mode, was meant to allow 8 frequency scans to be averaged to block out background noise. Was mildly effective
+        if (digitalRead(select_button) == BUTTONPRESSED){
+          calibrationMode = 1^calibrationMode;
+        }
+
+        
+        
+      //draw frequency spectrum on screen
+        for (int x = 0; x < (128); x++) {
+          int y;
+
+          y = ampScaled[x];
+          if (y >= SSD1351HEIGHT){
+            y = SSD1351HEIGHT - 1;
+          }
+          if (y == 0) {
+            tft.drawPixel(x, SSD1351HEIGHT - 1, RED );
+          }
+          else {
+            tft.drawFastVLine(x, (SSD1351HEIGHT - 1 - y), (SSD1351HEIGHT - 1), RED);
+          }
+        }
+        if (cursorMode == CURSOR_ON) {
+          //all relates to information described on the screen. 
+          double distance = freq[cursorX]/(slope)*c; //calculate distance radar traveled
+          drawCursor(cursorX, ampScaled[cursorX], YELLOW); //draw cursor
+          itoa(freq[cursorX], xChar, 10); //converts the number into a string that can be passed into tftPrint
+          itoa(amp[cursorX], yChar, 10);
+          itoa(fs, FsChar, 10);
+          dtostrf(distance,5,2,distanceChar);
+          tftPrint(0, 0, 1, "Freq: ");
+          tftPrint(35, 0, 1, xChar);
+          tftPrint(0, 10, 1, yChar);
+          tftPrint(70, 0, 1, "Fs: ");
+          tftPrint(90, 0, 1, FsChar);
+          tftPrint(0, 20, 1, distanceChar);
+        }
+        if(calibrationMode){
+          if(calibrationSave){
+            tftPrint(90, 10, 1, "CALS"); //stands for "calibration saved" as in. the data has been averaged and subtracted from the displayed data, but it is currently not 
+          }                               //using more points to calibrate further.
+          else{
+            tftPrint(90, 10, 1, "CAL"); //"calibrating" the data is currently being averaged and subtracted from the signal
+          }   
+        }
+      
+    }
+  }
+}
+
+void tftPrintTest() {
+  tft.fillScreen(BLACK);
+  tft.setCursor(0, 5);
+  tft.setTextColor(GREEN);
+  tft.setTextSize(3);
+  tft.println("Splash Screen!");
+  delay(500);
+}
+
+
+void tftPrint(int x, int y, int txtSize, char* text) {
+  tft.setCursor(x, y);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(txtSize);
+  tft.print(text);
+}
+
+
+void drawCursor(int x, int y, uint16_t color)
+{
+  y = SSD1351HEIGHT - y;
+  int spacing = 2;
+  if (!((x + spacing) > (SSD1351WIDTH - spacing))){
+    tft.drawPixel(x + spacing, y, color);
+  }
+  if (!((x - spacing) < 0)){
+    tft.drawPixel(x - spacing, y, color);
+  }
+  if (!((y + spacing) > (SSD1351HEIGHT - spacing))){
+    tft.drawPixel(x, y + spacing, color);
+  }
+  if (!((x + spacing) < 0)){
+    tft.drawPixel(x, y - spacing, color);
+  }
+}
+
+
+//read ADC every interrupt cycle
+void readADC(void) {
+  
+  bool dataBit;
+  uint16_t data;
+  digitalWrite(clock_pin, HIGH);
+  digitalWrite(cs_pin, LOW);
+  digitalWrite(clock_pin, LOW);
+
+  for (int x = 0; x < 6; x++) {
+    digitalWrite(clock_pin, HIGH);
+    //delay(1);
+    digitalWrite(clock_pin, LOW);
+  }
+
+  for (int x = 0; x < 16; x++) {
+    digitalWrite(clock_pin, HIGH);
+    dataBit = digitalRead(data_pin);
+    digitalWrite(clock_pin, LOW);
+    data = (data | (dataBit << (15 - x)));
+  }
+
+  digitalWrite(cs_pin, HIGH);
+  for (int x = 0; x < 3; x++) {
+    digitalWrite(clock_pin, HIGH);
+    digitalWrite(clock_pin, LOW);
+  }
+  realTime[ADCCount] = data;
+  ADCCount++;
+  if(ADCCount >= FFTPoints){
+    noInterrupts();
+    ADCCount = 0;
+    ADCFull = true;
+  }
+  return;
+}
+
+
+
+/*
+   This computes an in-place complex-to-complex FFT
+   x and y are the real and imaginary arrays of 2^m points.
+   dir =  1 gives forward transform
+   dir = -1 gives reverse transform
+*/
+
+short FFT(short int dir, int m, float *x, float *y)
+{
+  int n, i, i1, j, k, i2, l, l1, l2;
+  float c1, c2, tx, ty, t1, t2, u1, u2, z;
+
+  /* Calculate the number of points */
+  n = 1;
+  for (i = 0; i < m; i++)
+    n *= 2;
+
+  /* Do the bit reversal */
+  i2 = n >> 1;
+  j = 0;
+  for (i = 0; i < n - 1; i++) {
+    if (i < j) {
+      tx = x[i];
+      ty = y[i];
+      x[i] = x[j];
+      y[i] = y[j];
+      x[j] = tx;
+      y[j] = ty;
+    }
+    k = i2;
+    while (k <= j) {
+      j -= k;
+      k >>= 1;
+    }
+    j += k;
+  }
+  /* Compute the FFT */
+  c1 = -1.0;
+  c2 = 0.0;
+  l2 = 1;
+  for (l = 0; l < m; l++) {
+    l1 = l2;
+    l2 <<= 1;
+    u1 = 1.0;
+    u2 = 0.0;
+    for (j = 0; j < l1; j++) {
+      for (i = j; i < n; i += l2) {
+        i1 = i + l1;
+        t1 = u1 * x[i1] - u2 * y[i1];
+        t2 = u1 * y[i1] + u2 * x[i1];
+        x[i1] = x[i] - t1;
+        y[i1] = y[i] - t2;
+        x[i] += t1;
+        y[i] += t2;
+      }
+      z =  u1 * c1 - u2 * c2;
+      u2 = u1 * c2 + u2 * c1;
+      u1 = z;
+    }
+    c2 = sqrt((1.0 - c1) / 2.0);
+    if (dir == 1)
+      c2 = -c2;
+    c1 = sqrt((1.0 + c1) / 2.0);
+  }
+  /* Scaling for forward transform */
+  if (dir == 1) {
+    for (i = 0; i < n; i++) {
+      x[i] /= n;
+      y[i] /= n;
+    }
+  }
+  return (0);
+}
+
+
+//quick attempt at an FFT windowin function to get slightly cleaner results.
+void hann(float *realFreq, int FFTPoints){
+  for(int n = 0; n < FFTPoints; n++){  
+    realFreq[n] = realFreq[n]*0.5*(1-cos(2*p*n/FFTPoints));
+  }
+}
